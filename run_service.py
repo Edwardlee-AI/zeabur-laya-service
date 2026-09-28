@@ -263,6 +263,47 @@ def _wait_port_free(port, attempts=30):
     return False
 
 
+def _pin_router(router, pin):
+    """Restrict routing (and therefore loading) to the models in `pin`.
+
+    laya's Router lazy-loads whichever checkpoint a request routes to, and
+    `preload()` raises `max_loaded` to fit the preloaded set, so an English
+    request against a multilingual-only deployment builds the english
+    checkpoint on demand. Two resident checkpoints peaked ~2.6 GiB here and
+    the shared 8 GiB Zeabur pool (OpenClaw ~3 GiB + ClickHouse + other
+    services + this one) OOM-killed the container within a minute (observed
+    2026-09-28 19:09). Pinning keeps exactly the preloaded set resident;
+    other traffic still works, just on the pinned checkpoint (English on
+    multilingual scores ~0.66 MASSIVE intent vs ~0.78 on the english
+    checkpoint -- a fair trade for a pod that stays up).
+    """
+    from laya.router import _repo_str
+    allowed = {m for m in pin if m in getattr(router, "models", {})}
+    unknown = [m for m in pin if m not in allowed]
+    if unknown:
+        _log("LAYA_PIN ignoring unknown models: %s" % unknown)
+    if not allowed:
+        _log("LAYA_PIN: nothing valid to pin; router left unpinned")
+        return
+    repos = {k: _repo_str(router.models[k]) for k in allowed}
+    primary = sorted(allowed)[0]
+    orig_route = router._route
+
+    def _pinned_route(state, questions=None, model=None, task=None, lang=None, lang_guess=None):
+        d = orig_route(state, questions, model=model, task=task, lang=lang, lang_guess=lang_guess)
+        if d.get("model") not in allowed:
+            reason = d.get("reason")
+            d = dict(d)
+            d["model"] = primary
+            d["repo"] = repos[primary]
+            d["reason"] = "pinned to %r by LAYA_PIN; original route: %s" % (primary, reason)
+        return d
+
+    router._route = _pinned_route
+    router.max_loaded = len(allowed)
+    _log("LAYA_PIN active: only %s can ever be resident" % sorted(allowed))
+
+
 def main():
     tmp = _TmpServer((HOST, PORT), _LoadingHandler)
     threading.Thread(target=tmp.serve_forever, daemon=True).start()
@@ -280,11 +321,27 @@ def main():
         _log("auto checkpoint selection: limit=%s -> %s"
              % (("%.2f GiB" % (limit / GIB)) if limit else "unknown", chosen))
     else:
+        chosen = [m.strip() for m in os.environ["LAYA_MODELS"].split(",") if m.strip()]
         _log("LAYA_MODELS set by operator: %r" % os.environ["LAYA_MODELS"])
 
-    from laya.serve import create_app
+    # Pin routing to the preload set (LAYA_PIN overrides; none/off/* disables).
+    # Without this, a request in another script lazy-loads a second checkpoint:
+    # two resident peaked ~2.6 GiB and the shared pool OOM-killed the pod
+    # within 60s (observed 2026-09-28 19:09).
+    pin_env = os.environ.get("LAYA_PIN", "").strip()
+    if pin_env.lower() in ("none", "off", "*"):
+        pin = []
+    elif pin_env:
+        pin = [m.strip() for m in pin_env.split(",") if m.strip()]
+    else:
+        pin = chosen
+
+    from laya.serve import build_router, create_app
     t0 = time.time()
-    app = create_app()  # preloads the chosen checkpoints (HF download on first boot)
+    router = build_router()  # preloads the chosen checkpoints (HF download on first boot)
+    if pin:
+        _pin_router(router, pin)
+    app = create_app(router=router)
     _log("create_app done in %.1fs, rss=%d MiB" % (time.time() - t0, _mem_rss_mb()))
 
     tmp.shutdown()

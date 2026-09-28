@@ -34,9 +34,16 @@ LAYA_API_KEY=<自訂一個密鑰>
 
 可選：
 - `LAYA_MODELS` 而家**唔使設**：自動讀 container memory limit 揀（見下）。手動設咗就以你嘅為準。
+- `LAYA_PIN`：限制 router 永遠淨用 preload 嘅 checkpoint（預設開）。設 `none`／`off` 關閉。
+  呢個係 2026-09-28 第二次 OOM 嘅修復：英文 request 會 lazy-load 第二個 checkpoint，
+  兩個齊載 ~2.6G 喺共享 8G pool 度 60 秒內被殺（實測 19:09）。釘死後英文照答，
+  只係行 multilingual（英文 MASSIVE intent 0.657 vs 0.783，換 pod 唔死）。
 - `LAYA_PRELOAD=0`（完全 lazy，第一個 request 先載入；唔建議，因為 /v1/systemone 會等好耐）
 
 ### 自動 checkpoint 選擇（2026-09-28 fix）
+
+⚠️ 8GB 共享 pool 實測教訓（19:09）：`loaded:["multilingual"]` 穩行一個鐘，一有英文 request
+lazy-load 埋 english → 兩個齊載 ~2.6G → 60 秒內 OOM 被殺。所以而家 default 釘死 LAYA_PIN。
 
 `LAYA_MODELS` 未設時，entrypoint 讀 cgroup memory limit 自動揀：
 
