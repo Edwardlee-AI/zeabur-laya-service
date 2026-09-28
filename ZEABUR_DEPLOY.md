@@ -33,13 +33,38 @@ LAYA_API_KEY=<自訂一個密鑰>
 ```
 
 可選：
-- `LAYA_MODELS=multilingual`（只 preload 一個 checkpoint，慳 RAM，用喺 2 GiB plan）
+- `LAYA_MODELS` 而家**唔使設**：自動讀 container memory limit 揀（見下）。手動設咗就以你嘅為準。
 - `LAYA_PRELOAD=0`（完全 lazy，第一個 request 先載入；唔建議，因為 /v1/systemone 會等好耐）
+
+### 自動 checkpoint 選擇（2026-09-28 fix）
+
+`LAYA_MODELS` 未設時，entrypoint 讀 cgroup memory limit 自動揀：
+
+| Plan RAM | 載入 | 峰值約 |
+|---|---|---|
+| ≥5.5 GiB | english + multilingual + typed-decisions | ~3 GiB |
+| 3–5.5 GiB | english + multilingual | ~2.2 GiB |
+| 1.5–3 GiB | multilingual（支援中英） | ~1.4 GiB |
+| <1.5 GiB | english only（警告） | ~1 GiB |
+
+背景：首次部署三個全載曾經成功報 `ok` 但隨即 crash loop — 峰值貼頂 OOM。自動揀就唔會咁。
+
+### 載入期間嘅回應
+
+- `GET /health` → 200 `{"status":"loading"}`（health check 唔會殺 pod）
+- `POST /v1/systemone` → 503 `{"status":"loading"}`（唔再係 http.server 嗰個 501 HTML）
+
+## Volume（強烈建議）
+
+掛一個 persistent volume 喺 **`/app/.cache`**（HF_HOME）。
+冇 volume：每次 restart 都要重新由 Hugging Face 下載 ~1.5G checkpoint（要幾分鐘，crash loop 時更慘）。
+有 volume：落一次之後 restart 秒載。
 
 ## Resource 建議
 
-- 最低：2 vCPU / 2 GiB RAM（配 `LAYA_MODELS=multilingual`）
-- 建議：2 vCPU / **4 GiB RAM**（全部三個 checkpoint preload，bf16 後實測 ~1.2–1.5 GiB 用量）
+- 最低：2 vCPU / 2 GiB RAM（自動淨載 multilingual）
+- 建議：2 vCPU / **4 GiB RAM**（自動載 english + multilingual，中英都齊）
+- 想三個 checkpoint 全載（連 typed-decisions）：8 GiB
 
 ## 第一次啟動
 

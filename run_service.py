@@ -5,11 +5,19 @@ Stack:
 1. bf16 load patches proven in tools/laya/test_v3.py (2026-09-27):
    default-dtype coercion, F.linear dtype alignment, chunked lazy
    safetensors load -> roughly halves checkpoint RAM and bounds load peak.
-2. laya's official HTTP server (laya.serve): POST /v1/systemone (TypeSafe
+2. Memory-aware checkpoint selection (2026-09-28 crash-loop fix):
+   reads the cgroup memory limit and preloads only the checkpoints that
+   fit. The 13:38 UTC first deploy proved all-three CAN load (health ok),
+   but the pod died seconds later and crash-looped -- classic peak-RAM OOM
+   at the exact moment preload completes. Do not trust the operator to
+   set LAYA_MODELS; decide here, from the real limit.
+3. laya's official HTTP server (laya.serve): POST /v1/systemone (TypeSafe
    Jev wire protocol) + GET /health, optional bearer auth via LAYA_API_KEY.
-3. A temporary /health responder during checkpoint download+load, so a
+4. A temporary /health responder during checkpoint download+load, so a
    container health check cannot kill the slow first boot (HF download of
-   ~1.5G). uvicorn takes over the port once models are resident.
+   ~1.5G). GET answers 200 {"status":"loading"}; POST answers 503 so
+   clients can tell "still loading" from "real error". uvicorn takes over
+   the port once models are resident.
 """
 import gc
 import os
@@ -21,9 +29,69 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("LAYA_PORT", "8000"))
 HOST = os.environ.get("LAYA_HOST", "0.0.0.0")
 
+GIB = 1 << 30
+
 
 def _log(msg):
     print("[laya-entry] %s" % msg, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 0. memory helpers (cgroup v2 -> v1 -> /proc/meminfo)
+# ---------------------------------------------------------------------------
+def detect_memory_limit_bytes():
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw in ("max", ""):
+                continue
+            val = int(raw)
+            if val > (1 << 50):  # v1 "unlimited" sentinel
+                continue
+            return val
+        except (OSError, ValueError):
+            continue
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _mem_rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
+def choose_checkpoints(limit_bytes):
+    """Pick the checkpoint set that fits the pod with sane headroom.
+
+    All three checkpoints are ~1.16B params (~2.2 GiB bf16 weights) plus
+    ~0.6-1 GiB Python/torch/transformers runtime. Observed 2026-09-28:
+    all-three peaks right at a small plan's ceiling and OOM-kills the
+    container the moment preload finishes.
+    """
+    if limit_bytes <= 0:
+        return ["english", "multilingual"]
+    gib = limit_bytes / GIB
+    if gib < 1.5:
+        _log("WARNING: %.2f GiB limit too small for multilingual; english only" % gib)
+        return ["english"]
+    if gib < 3.0:
+        return ["multilingual"]
+    if gib < 5.5:
+        return ["english", "multilingual"]
+    return ["english", "multilingual", "typed-decisions"]
 
 
 # ---------------------------------------------------------------------------
@@ -158,13 +226,21 @@ class _LoadingHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def do_GET(self):
+    def _reply(self, code):
         body = b'{"status":"loading"}'
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        self._reply(200)
+
+    def do_POST(self):
+        # 503 so smoke tests distinguish "still loading" from a real error,
+        # instead of http.server's opaque 501 "Unsupported method".
+        self._reply(503)
 
 
 class _TmpServer(ThreadingHTTPServer):
@@ -193,15 +269,28 @@ def main():
     _log("temp /health responder up on :%d (status=loading)" % PORT)
 
     install_load_patches()
+    _log("rss after patches: %d MiB" % _mem_rss_mb())
+
+    # Memory-aware checkpoint selection BEFORE laya.serve reads the env.
+    # Explicit LAYA_MODELS always wins.
+    if not os.environ.get("LAYA_MODELS", "").strip():
+        limit = detect_memory_limit_bytes()
+        chosen = choose_checkpoints(limit)
+        os.environ["LAYA_MODELS"] = ",".join(chosen)
+        _log("auto checkpoint selection: limit=%s -> %s"
+             % (("%.2f GiB" % (limit / GIB)) if limit else "unknown", chosen))
+    else:
+        _log("LAYA_MODELS set by operator: %r" % os.environ["LAYA_MODELS"])
+
     from laya.serve import create_app
     t0 = time.time()
-    app = create_app()  # preloads checkpoints (HF download on first boot)
-    _log("create_app done in %.1fs" % (time.time() - t0))
+    app = create_app()  # preloads the chosen checkpoints (HF download on first boot)
+    _log("create_app done in %.1fs, rss=%d MiB" % (time.time() - t0, _mem_rss_mb()))
 
     tmp.shutdown()
     tmp.server_close()
     _wait_port_free(PORT)
-    _log("handing :%d to uvicorn" % PORT)
+    _log("handing :%d to uvicorn, rss=%d MiB" % (PORT, _mem_rss_mb()))
 
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT,

@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV HF_HOME=/app/.cache/huggingface \
     LAYA_HOST=0.0.0.0 \
-    LAYA_PORT=8000
+    LAYA_PORT=8000 \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
